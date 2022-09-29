@@ -25,25 +25,15 @@ open Elab
 open Meta
 open FuzzyMatching
 
---abbrev CoreM := ReaderT Context <| StateRefT State (EIO Exception)
--- abbrev MetaM  := ReaderT Context $ StateRefT State CoreM
-
 builtin_initialize completionBlackListExt : TagDeclarationExtension ← mkTagDeclarationExtension `blackListCompletion
-
-structure State where
-  itemsMain  : Array (CompletionItem × Float) := #[]
-  itemsOther : Array (CompletionItem × Float) := #[]
-  messages : Array String := #[]
-
-abbrev M := OptionT $ StateRefT State MetaM
 
 @[export lean_completion_add_to_black_list]
 def addToBlackList (env : Environment) (declName : Name) : Environment :=
   completionBlackListExt.tag env declName
 
-private def isBlackListed (declName : Name) (isLocal: Bool) : M Bool := do
+private def isBlackListed (declName : Name) : MetaM Bool := do
   let env ← getEnv
-  (pure (declName.isInternal && !isPrivateName declName && !isLocal))
+  (pure (declName.isInternal && !isPrivateName declName))
   <||> (pure <| isAuxRecursor env declName)
   <||> (pure <| isNoConfusion env declName)
   <||> isRec declName
@@ -85,6 +75,12 @@ private def mkCompletionItem (label : Name) (type : Expr) (docString? : Option S
   let doc? := docString?.map fun docString => { value := docString, kind := MarkupKind.markdown : MarkupContent }
   let detail ← consumeImplicitPrefix type fun type => return toString (← Meta.ppExpr type)
   return { label := label.getString!, detail? := detail, documentation? := doc?, kind? := kind }
+
+structure State where
+  itemsMain  : Array (CompletionItem × Float) := #[]
+  itemsOther : Array (CompletionItem × Float) := #[]
+
+abbrev M := OptionT $ StateRefT State MetaM
 
 private def addCompletionItem (label : Name) (type : Expr) (expectedType? : Option Expr) (declName? : Option Name) (kind : CompletionItemKind) (score : Float) : M Unit := do
   let docString? ← if let some declName := declName? then findDocString? (← getEnv) declName else pure none
@@ -253,10 +249,8 @@ private def idCompletionCore (ctx : ContextInfo) (id : Name) (hoverInfo : HoverI
         addCompletionItem localDecl.userName localDecl.type expectedType? none (kind := CompletionItemKind.variable) score
   -- search for matches in the environment
   let env ← getEnv
-  let index := env.const2ModIdx
   env.constants.forM fun declName c => do
-    let isLocal := index[declName].isNone
-    unless (← isBlackListed declName isLocal) do
+    unless (← isBlackListed declName) do
       let matchUsingNamespace (ns : Name): M Bool := do
         if let some (label, score) ← matchDecl? ns id danglingDot declName then
           -- dbg_trace "matched with {id}, {declName}, {label}"
@@ -290,16 +284,15 @@ private def idCompletionCore (ctx : ContextInfo) (id : Name) (hoverInfo : HoverI
   -- Auxiliary function for `alias`
   let addAlias (alias : Name) (declNames : List Name) (score : Float) : M Unit := do
     declNames.forM fun declName => do
-      unless (← isBlackListed declName false) do
+      unless (← isBlackListed declName) do
         addCompletionItemForDecl alias declName expectedType? score
   -- search explicitily open `ids`
   for openDecl in ctx.openDecls do
     match openDecl with
     | OpenDecl.explicit openedId resolvedId =>
-      unless (← isBlackListed resolvedId true) do
+      unless (← isBlackListed resolvedId) do
         if let some score := matchAtomic id openedId then
           addCompletionItemForDecl openedId resolvedId expectedType? score
-
     | OpenDecl.simple ns _      =>
       getAliasState env |>.forM fun alias declNames => do
         if let some score := matchAlias ns alias then
@@ -323,14 +316,9 @@ private def idCompletionCore (ctx : ContextInfo) (id : Name) (hoverInfo : HoverI
   -- Search namespaces
   completeNamespaces ctx id danglingDot
 
-private def idCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Name) (hoverInfo : HoverInfo) (danglingDot : Bool) (expectedType? : Option Expr) : IO (Option CompletionList) := do
-  IO.println s!"idCompletion {id}"
-
+private def idCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Name) (hoverInfo : HoverInfo) (danglingDot : Bool) (expectedType? : Option Expr) : IO (Option CompletionList) :=
   runM ctx lctx do
     idCompletionCore ctx id hoverInfo danglingDot expectedType?
-    let s ← get
-    for s in s.messages do
-      IO.println s
 
 private def unfoldeDefinitionGuarded? (e : Expr) : MetaM (Option Expr) :=
   try unfoldDefinition? e catch _ => pure none
@@ -367,8 +355,7 @@ where
     let some type ← unfoldeDefinitionGuarded? type | return ()
     visit type
 
-private def dotCompletion (ctx : ContextInfo) (info : TermInfo) (hoverInfo : HoverInfo) (expectedType? : Option Expr) : IO (Option CompletionList) := do
-  IO.println s!"dotCompletion {info.expr}"
+private def dotCompletion (ctx : ContextInfo) (info : TermInfo) (hoverInfo : HoverInfo) (expectedType? : Option Expr) : IO (Option CompletionList) :=
   runM ctx info.lctx do
     let nameSet ← try
       getDotCompletionTypeNames (← instantiateMVars (← inferType info.expr))
@@ -383,18 +370,14 @@ private def dotCompletion (ctx : ContextInfo) (info : TermInfo) (hoverInfo : Hov
       else
         failure
     else
-      let env ← getEnv
-      let modIndex := env.const2ModIdx
-      env.constants.forM fun declName c => do
-        let isLocal := modIndex[declName].isNone
+      (← getEnv).constants.forM fun declName c => do
         let typeName := (← normPrivateName declName).getPrefix
         if nameSet.contains typeName then
-          unless (← isBlackListed c.name isLocal) do
+          unless (← isBlackListed c.name) do
             if (← isDotCompletionMethod typeName c) then
               addCompletionItem c.name.getString! c.type expectedType? c.name (kind := (← getCompletionKindForDecl c)) 1
 
-private def dotIdCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Name) (expectedType? : Option Expr) : IO (Option CompletionList) := do
-  IO.println s!"dotIdCompletion {id}"
+private def dotIdCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Name) (expectedType? : Option Expr) : IO (Option CompletionList) :=
   runM ctx lctx do
     let some expectedType := expectedType? | return ()
     let resultTypeFn := (← instantiateMVars expectedType).cleanupAnnotations.getAppFn
@@ -403,8 +386,7 @@ private def dotIdCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Name
       let some (label, score) ← matchDecl? typeName id (danglingDot := false) declName | pure ()
       addCompletionItem label c.type expectedType? declName (← getCompletionKindForDecl c) score
 
-private def fieldIdCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Name) (structName : Name) : IO (Option CompletionList) := do
-  IO.println s!"fieldIdCompletion {id}"
+private def fieldIdCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Name) (structName : Name) : IO (Option CompletionList) :=
   runM ctx lctx do
     let idStr := id.toString
     let fieldNames := getStructureFieldsFlattened (← getEnv) structName (includeSubobjectFields := false)
@@ -414,8 +396,7 @@ private def fieldIdCompletion (ctx : ContextInfo) (lctx : LocalContext) (id : Na
       let item := { label := fieldName, detail? := "field", documentation? := none, kind? := CompletionItemKind.field }
       modify fun s => { s with itemsMain := s.itemsMain.push (item, score) }
 
-private def optionCompletion (ctx : ContextInfo) (stx : Syntax) (caps : ClientCapabilities) : IO (Option CompletionList) := do
-  IO.println s!"optionCompletion {stx}"
+private def optionCompletion (ctx : ContextInfo) (stx : Syntax) (caps : ClientCapabilities) : IO (Option CompletionList) :=
   ctx.runMetaM {} do
     let (partialName, trailingDot) :=
       -- `stx` is from `"set_option" >> ident`
@@ -450,8 +431,7 @@ private def optionCompletion (ctx : ContextInfo) (stx : Syntax) (caps : ClientCa
              textEdit? := textEdit }, score)
     return some { items := sortCompletionItems items, isIncomplete := true }
 
-private def tacticCompletion (ctx : ContextInfo) : IO (Option CompletionList) := do
-  IO.println s!"tacticCompletion"
+private def tacticCompletion (ctx : ContextInfo) : IO (Option CompletionList) :=
   -- Just return the list of tactics for now.
   ctx.runMetaM {} do
     let table := Parser.getCategory (Parser.parserExtension.getState (← getEnv)).categories `tactic |>.get!.tables.leadingTable
@@ -460,29 +440,77 @@ private def tacticCompletion (ctx : ContextInfo) : IO (Option CompletionList) :=
       items.push ({ label := tk.toString, detail? := none, documentation? := none, kind? := CompletionItemKind.keyword }, 1)
     return some { items := sortCompletionItems items, isIncomplete := true }
 
-partial def myfind? (fileMap : FileMap) (hoverPos : String.Pos) (infoTree : InfoTree) (caps : ClientCapabilities) : IO (Option CompletionList) := do
+def isHole (info : Info) :=
+  if let some e := info.toElabInfo? then
+    dbg_trace s!"e.stx.getKind={e.stx.getKind}"
+    e.stx.getKind == `Lean.Parser.Term.hole
+  else
+    false
+
+partial def myFind? (fileMap : FileMap) (hoverPos : String.Pos) (infoTree : InfoTree) (caps : ClientCapabilities) : IO (Option CompletionList) := do
   let ⟨hoverLine, _⟩ := fileMap.toPosition hoverPos
   IO.println s!"Running my find method for line {hoverLine}..."
 
-  match infoTree.foldInfo (init := none) (choose fileMap hoverLine) with
-  | some (hoverInfo, ctx, Info.ofCompletionInfo info) =>
-    match info with
-    | .dot info (expectedType? := expectedType?) .. => dotCompletion ctx info hoverInfo expectedType?
-    | .id _   id danglingDot lctx expectedType? => idCompletion ctx lctx id hoverInfo danglingDot expectedType?
-    | .dotId _  id lctx expectedType? => dotIdCompletion ctx lctx id expectedType?
-    | .fieldId _ id lctx structName => fieldIdCompletion ctx lctx id structName
-    | .option stx => optionCompletion ctx stx caps
-    | .tactic .. => tacticCompletion ctx
-    | _ =>
-      IO.println "unknown info type"
+  let result := infoTree.foldInfo (λ (ctx : ContextInfo) (info : Info) (i : List (ContextInfo × Info)) => (ctx, info) :: i) []
+  for (ctx, info) in result do
+     let s ← info.format ctx
+     IO.println s!"Info: {s}"
+
+  -- find info objects whose span ends exactly at the hoverPos.
+  let exacts := infoTree.foldInfo (λ (ctx : ContextInfo) (info : Info) (i : List (ContextInfo × Info)) =>
+    if let some d := info.occursBefore? hoverPos then
+      if d == 0 then
+        (ctx, info) :: i
+      else []
+    else i)   []
+
+  for (ctx, info) in exacts do
+    let inside := info.occursInside? hoverPos |>.isSome
+    let s ← info.format ctx
+    dbg_trace s!"### Exact Info: {s} : isCompletion={info.isCompletion} and inside={inside}"
+    if isHole info then
+      dbg_trace s!"### Found a hole!"
       return none
+
+  match infoTree.foldInfo (init := none) (choose fileMap hoverLine) with
+  | some (hoverInfo, ctx, info) =>
+    let s ← info.format ctx
+    IO.println s!"Found Info: {s}"
+
+    match info with
+    | .ofCompletionInfo completion =>
+      match completion with
+      | .dot info (expectedType? := expectedType?) .. => dotCompletion ctx info hoverInfo expectedType?
+      | .id _   id danglingDot lctx expectedType? => idCompletion ctx lctx id hoverInfo danglingDot expectedType?
+      | .dotId _  id lctx expectedType? => dotIdCompletion ctx lctx id expectedType?
+      | .fieldId _ id lctx structName => fieldIdCompletion ctx lctx id structName
+      | .option stx => optionCompletion ctx stx caps
+      | .tactic .. => tacticCompletion ctx
+      | _ =>
+        IO.println "unknown CompletionInfo type"
+        return none
+    | .ofTermInfo term =>
+
+      IO.println s!"termInfo {term.stx}"
+      return none
+    | _ =>
+      IO.println "unhandled Info type"
+      return none
+
   | _ =>
     IO.println "TODO try to extract id from `fileMap` and some `ContextInfo` from `InfoTree`"
     return none
+
 where
   choose (fileMap : FileMap) (hoverLine : Nat) (ctx : ContextInfo) (info : Info) (best? : Option (HoverInfo × ContextInfo × Info)) : Option (HoverInfo × ContextInfo × Info) :=
-    if !info.isCompletion then best?
-    else if info.occursInside? hoverPos |>.isSome then
+    let skip := if !info.isCompletion then
+      if let some (_, _, info) := best? then
+        info.isCompletion
+      else false
+    else false
+
+    if skip then best? else
+    if info.occursInside? hoverPos |>.isSome then
       let headPos          := info.pos?.get!
       let ⟨headPosLine, _⟩ := fileMap.toPosition headPos
       let ⟨tailPosLine, _⟩ := fileMap.toPosition info.tailPos?.get!
@@ -504,7 +532,7 @@ where
       let ⟨line, _⟩ := fileMap.toPosition pos
       if line != hoverLine then best?
       else match best? with
-        | none => return (HoverInfo.after, ctx, info)
+        | none => (HoverInfo.after, ctx, info)
         | some (_, _, best) =>
           let dBest := best.occursBefore? hoverPos |>.get!
           if d < dBest || (d == dBest && info.isSmaller best) then
@@ -543,10 +571,13 @@ partial def getInfoTree (fileName: String) : IO Unit := do
   let commandState := configureCommandState environment messages
   let s ← IO.processCommands context state commandState
   let trees := s.commandState.infoState.trees.toList
+  IO.println s!"found {trees.length} trees"
 
-  let infoTree : InfoTree := (trees.drop 3).head!
+  let infoTree : InfoTree := trees.getLast!
 
-  let olist ← myfind? fileMap contents.endPos infoTree caps
+  IO.println s!"contents.endPos={contents.endPos}"
+
+  let olist ← myFind? fileMap contents.endPos infoTree caps
   if let some list := olist then
     for i in list.items do
       if let some detail := i.detail? then
@@ -554,5 +585,4 @@ partial def getInfoTree (fileName: String) : IO Unit := do
       else
         IO.println s!"{i.label}"
 
-
-#eval getInfoTree "d:\\temp\\lean_examples\\master\\Main.lean"
+ #eval getInfoTree "d:\\temp\\lean_examples\\Master\\Main.lean"
